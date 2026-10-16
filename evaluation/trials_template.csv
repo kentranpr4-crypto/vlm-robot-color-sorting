@@ -1,0 +1,6 @@
+trial_id,prompt,expected_object,selected_object,expected_zone,actual_zone,selection_correct,pick_success,place_success,duration_s,notes
+T1-01,pick up the red cube,red_cube,,red_zone,,,,,,
+T2-01,pick up the blue cube,blue_cube,,blue_zone,,,,,,
+T3-01,pick up the green sphere,green_sphere,,green_zone,,,,,,
+T4-01,pick up the yellow cylinder,yellow_cylinder,,yellow_zone,,,,,,
+T5-01,pick up the purple cube,none,,none,,,,,,
