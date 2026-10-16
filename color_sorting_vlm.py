@@ -21,6 +21,7 @@ Features:
 - Vision-language (CLIP) based object identification and selection
 - Automated color matching and placement
 - Interactive text prompt mode with command validation
+- Visual control panel (mode 3): camera, sorted CLIP scores, zone buttons
 - Placement verified from the simulator state (not from the motion call returning)
 
 Usage:
@@ -34,7 +35,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from vlm_helpers import (
-    AMBIGUOUS, OK, NO_OBJECTS, ZONE_MENU, FREEFORM_PREFIX, SHAPE_SYNONYMS,
+    AMBIGUOUS, OK, NO_OBJECTS, ZONE_MENU, SPECIAL_DESTINATIONS, FREEFORM_PREFIX, SHAPE_SYNONYMS,
     SUPPORTED_COLORS, Style, banner, panel, rule, score_table, paint_object,
     parse_command, validate_crops, select_target, parse_zone_choice,
     zone_side, verify_in_zone, is_lifted, describe_catalog, example_commands,
@@ -55,10 +56,11 @@ def main():
     print(f"   {S('1', 'bold', 'cyan')}  Automatic color sorting  {S('(sort all objects by color)', 'gray')}")
     example = S('(e.g. "Pick up the red cube")', 'gray')
     print(f"   {S('2', 'bold', 'cyan')}  Interactive text prompts {example}")
+    print(f"   {S('3', 'bold', 'cyan')}  Visual control panel     {S('(window with camera, CLIP scores, buttons)', 'gray')}")
     print()
 
-    choice = input(S("  Select mode (1/2, default=1): ", "bold")).strip()
-    if choice not in ("", "1", "2"):
+    choice = input(S("  Select mode (1/2/3, default=1): ", "bold")).strip()
+    if choice not in ("", "1", "2", "3"):
         print(S(f"  Unknown mode '{choice}', using 1 (automatic).", "yellow"))
         choice = "1"
 
@@ -113,6 +115,9 @@ def main():
         if choice == "2":
             # Interactive text prompts only
             run_interactive_text_prompt_demo(sim)
+        elif choice == "3":
+            # Same pipeline as mode 2, in a single window
+            run_visual_panel_demo(sim)
         else:
             # Automatic color sorting (default)
             print("\n🎨 Starting automatic color sorting...")
@@ -347,26 +352,26 @@ def execute_placement(sim, object_name, destination):
         safe_place_object(sim, object_name)
 
 
-def handle_command(sim, prompt, catalog, ask=input):
+def analyze_command(sim, prompt, catalog):
     """
-    Full pipeline for one text command. Returns a result dict:
-      status      - parser/selection status or 'DONE' / 'CANCELLED' / 'PICK_FAILED'
-      selected    - chosen object name or None
-      destination - zone name / 'throw' / 'safe' / None
-      placement   - 'VERIFIED' / 'NOT_IN_ZONE' / 'UNVERIFIED' / None
+    Language + vision part of the pipeline. Never moves the robot.
+
+    Returns dict: status, parsed, selection, camera_image, bounding_boxes.
+    status is OK / AMBIGUOUS or the rejection code.
     """
-    result = {'status': None, 'selected': None, 'destination': None,
-              'placement': None, 'picked': False, 'camera_image': None}
+    out = {'status': None, 'parsed': None, 'selection': None,
+           'camera_image': None, 'bounding_boxes': {}}
 
     # 1) Language: validate command against the objects that exist in the sim
     parsed = parse_command(prompt, catalog)
+    out['parsed'] = parsed
     print(rule())
     print(f"🔍 {S('Command', 'bold')}: {S(repr(prompt), 'cyan')}")
     if parsed.status not in (OK, AMBIGUOUS):
         print(panel(f"Rejected: {parsed.status}", [parsed.message,
                     S("Type 'help' for supported commands. Nothing was moved.", "gray")], kind="error"))
-        result['status'] = parsed.status
-        return result
+        out['status'] = parsed.status
+        return out
     detail = []
     if parsed.color or parsed.shape:
         detail.append(f"color={parsed.color or '-'}  shape={parsed.shape or '-'}")
@@ -378,20 +383,21 @@ def handle_command(sim, prompt, catalog, ask=input):
     # 2) Vision: camera image -> segmentation crops
     print(f"📸 {S('Capturing scene with segmentation...', 'bold')}")
     camera_image, bounding_boxes, crops = sim.capture_and_process_scene()
-    result['camera_image'] = camera_image
+    out['camera_image'], out['bounding_boxes'] = camera_image, bounding_boxes or {}
     valid_crops, problems = validate_crops(crops, bounding_boxes, catalog)
     for msg in problems:
         print(S(f"   ! {msg}", "yellow"))
     if not valid_crops:
         print(panel("No objects detected", ["The camera sees no usable object crops."], kind="error"))
-        result['status'] = NO_OBJECTS
-        return result
+        out['status'] = NO_OBJECTS
+        return out
 
     # 3) CLIP similarity (original ranking mechanism)
     scores, note = compute_clip_scores(sim, valid_crops, parsed.clip_text)
     if note:
         print(S(f"   ! {note}", "yellow"))
     selection = select_target(parsed, scores)
+    out['selection'] = selection
 
     print(f"\n📊 {S('CLIP similarity (sorted)', 'bold')}")
     for line in score_table(selection.ranking, selection.selected, parsed.candidates):
@@ -402,8 +408,71 @@ def handle_command(sim, prompt, catalog, ask=input):
     if selection.status not in (OK, AMBIGUOUS):
         print(panel(f"Rejected: {selection.status}", [selection.message,
                     S("Nothing was moved.", "gray")], kind="error"))
-        result['status'] = selection.status
+    elif selection.status == OK and not selection.clip_agrees:
+        print(S(f"   ! {selection.message}", "yellow"))
+    out['status'] = selection.status
+    return out
+
+
+def pick_verified(sim, selected):
+    """
+    Pick with the existing controller, then check the object actually rose.
+    On a failed grasp the gripper is opened and the robot returns home.
+
+    Returns (picked_call_ok, grasp_ok).
+    """
+    print(f"🤖 Picking up {selected}...")
+    before = get_object_position(sim, selected)
+    if not sim.pick_object(selected):
+        print(panel("Pick failed", [f"sim.pick_object('{selected}') returned False."], kind="error"))
+        return False, False
+    after = get_object_position(sim, selected)
+    if before is not None and after is not None and not is_lifted(before, after):
+        print(panel("Grasp not verified", [
+            f"Object did not rise with the gripper: {_fmt_pos(before)} → {_fmt_pos(after)}",
+            "Releasing and returning home; nothing will be placed."], kind="error"))
+        sim.control_gripper(sim.gripper_open_position)
+        sim.move_to_position(sim.home_position)
+        return True, False
+    return True, True
+
+
+def place_held_object(sim, selected, destination):
+    """
+    Place the held object, then verify from simulator state (not from the
+    motion call returning). Returns (placement_status, position).
+    """
+    print(f"🚚 Moving {paint_object(selected)} → {S(destination, 'bold')}")
+    execute_placement(sim, selected, destination)
+    settle()
+
+    status, pos = verify_placement(sim, selected, destination)
+    if status == "VERIFIED":
+        print(panel("Placement verified", [f"{selected} is at {_fmt_pos(pos)} inside {destination}."], kind="ok"))
+    elif status == "NOT_IN_ZONE":
+        print(panel("Placement NOT achieved", [f"{selected} ended at {_fmt_pos(pos)}, outside {destination}."], kind="error"))
+    else:
+        print(panel("Placement unverified", ["Could not read the object pose; result unknown."], kind="warn"))
+    return status, pos
+
+
+def handle_command(sim, prompt, catalog, ask=input):
+    """
+    Full pipeline for one text command (terminal mode). Returns a result dict:
+      status      - parser/selection status or 'DONE' / 'CANCELLED' / 'PICK_FAILED'
+      selected    - chosen object name or None
+      destination - zone name / 'throw' / 'safe' / None
+      placement   - 'VERIFIED' / 'NOT_IN_ZONE' / 'UNVERIFIED' / None
+    """
+    result = {'status': None, 'selected': None, 'destination': None,
+              'placement': None, 'picked': False, 'camera_image': None}
+
+    analysis = analyze_command(sim, prompt, catalog)
+    result['camera_image'] = analysis['camera_image']
+    if analysis['status'] not in (OK, AMBIGUOUS):
+        result['status'] = analysis['status']
         return result
+    parsed, selection = analysis['parsed'], analysis['selection']
 
     # 4) Ambiguity: never choose silently, ask the user
     if selection.status == AMBIGUOUS:
@@ -417,8 +486,6 @@ def handle_command(sim, prompt, catalog, ask=input):
             result['status'] = 'CANCELLED'
             return result
         selection.selected = selection.candidate_ranking[int(pick) - 1][0]
-    elif not selection.clip_agrees:
-        print(S(f"   ! {selection.message}", "yellow"))
 
     selected = selection.selected
     result['selected'] = selected
@@ -432,42 +499,347 @@ def handle_command(sim, prompt, catalog, ask=input):
         result['status'] = 'CANCELLED'
         return result
 
-    # 5) Robot: existing controller
-    print(f"🤖 Picking up {selected}...")
-    before = get_object_position(sim, selected)
-    if not sim.pick_object(selected):
-        print(panel("Pick failed", [f"sim.pick_object('{selected}') returned False."], kind="error"))
-        result['status'] = 'PICK_FAILED'
-        return result
-    after = get_object_position(sim, selected)
-    result['picked'] = True
-    if before is not None and after is not None and not is_lifted(before, after):
-        print(panel("Grasp not verified", [
-            f"Object did not rise with the gripper: {_fmt_pos(before)} → {_fmt_pos(after)}",
-            "Releasing and returning home; nothing will be placed."], kind="error"))
-        sim.control_gripper(sim.gripper_open_position)
-        sim.move_to_position(sim.home_position)
+    # 5) Robot: existing controller + grasp check
+    called, grasped = pick_verified(sim, selected)
+    result['picked'] = called
+    if not grasped:
         result['status'] = 'PICK_FAILED'
         return result
 
-    # 6) Placement zone (from the command, or ask)
+    # 6) Placement zone (from the command, or ask like the original demo)
     destination = parsed.zone or ask_destination(sim, ask)
     result['destination'] = destination
-    print(f"🚚 Moving {paint_object(selected)} → {S(destination, 'bold')}")
-    execute_placement(sim, selected, destination)
-    settle()
 
-    # 7) Verify from simulator state, not from the motion call returning
-    status, pos = verify_placement(sim, selected, destination)
-    result['placement'] = status
+    # 7) Place + verify
+    result['placement'], _ = place_held_object(sim, selected, destination)
     result['status'] = 'DONE'
-    if status == "VERIFIED":
-        print(panel("Placement verified", [f"{selected} is at {_fmt_pos(pos)} inside {destination}."], kind="ok"))
-    elif status == "NOT_IN_ZONE":
-        print(panel("Placement NOT achieved", [f"{selected} ended at {_fmt_pos(pos)}, outside {destination}."], kind="error"))
-    else:
-        print(panel("Placement unverified", ["Could not read the object pose; result unknown."], kind="warn"))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Visual control panel (matplotlib widgets - no extra dependencies)
+# ---------------------------------------------------------------------------
+
+PANEL_THEME = {
+    'bg': '#0f172a', 'card': '#1e293b', 'edge': '#334155', 'text': '#e2e8f0',
+    'muted': '#94a3b8', 'accent': '#38bdf8', 'gold': '#fbbf24',
+    'ok': '#22c55e', 'warn': '#f59e0b', 'error': '#ef4444',
+}
+OBJECT_HEX = {'red': '#ef4444', 'blue': '#3b82f6', 'green': '#22c55e', 'yellow': '#eab308'}
+STATUS_KIND = {
+    OK: 'ok', AMBIGUOUS: 'warn', 'VERIFIED': 'ok', 'NOT_IN_ZONE': 'error',
+    'UNVERIFIED': 'warn', 'PICK_FAILED': 'error', 'BUSY': 'accent', 'IDLE': 'muted',
+}
+
+
+def _object_hex(name):
+    color, _ = split_object_name(name or "")
+    return OBJECT_HEX.get(color, PANEL_THEME['muted'])
+
+
+class VisualControlPanel:
+    """
+    One-window GUI for the interactive pipeline:
+
+        command box -> Analyze -> camera + boxes, sorted CLIP bars, status
+                    -> choose zone (or from command) -> Execute -> verified result
+
+    Uses the same functions as the terminal mode (analyze_command,
+    pick_verified, place_held_object), so behaviour is identical.
+    """
+
+    ZONE_BUTTONS = (('red_zone', 'Red'), ('blue_zone', 'Blue'), ('green_zone', 'Green'),
+                    ('yellow_zone', 'Yellow'), ('throw', 'Throw'), ('safe', 'Safe'))
+    MAX_CANDIDATES = 3
+
+    def __init__(self, sim, pyplot=None):
+        from matplotlib.widgets import TextBox, Button
+
+        self.plt = pyplot or plt
+        self.sim = sim
+        self.catalog = list(sim.objects.keys())
+        self.analysis = None
+        self.selected = None
+        self.destination = None
+        self.busy = False
+        T = PANEL_THEME
+
+        fig = self.plt.figure(figsize=(15, 8.6), facecolor=T['bg'])
+        try:
+            fig.canvas.manager.set_window_title("VLM Robot Color Sorting - Control Panel")
+        except Exception:
+            pass
+        self.fig = fig
+        fig.text(0.02, 0.955, "VLM Robot Color Sorting", color=T['text'], fontsize=20, weight='bold')
+        fig.text(0.02, 0.925, "CLIP openai/clip-vit-base-patch32  ·  segmentation crops  ·  "
+                 "Franka Panda (PyBullet)  ·  pretrained VLM + programmed control, not a trained VLA",
+                 color=T['muted'], fontsize=9.5)
+
+        # Camera view
+        self.ax_cam = fig.add_axes([0.02, 0.30, 0.56, 0.60])
+        # CLIP scores
+        self.ax_scores = fig.add_axes([0.71, 0.57, 0.27, 0.33], facecolor=T['card'])
+        # Status card
+        self.ax_status = fig.add_axes([0.62, 0.30, 0.36, 0.19])
+        self.ax_status.set_axis_off()
+
+        # Command row
+        self.ax_cmd = fig.add_axes([0.10, 0.19, 0.38, 0.055])
+        fig.text(0.02, 0.21, "Command", color=T['text'], fontsize=11, weight='bold')
+        self.text_box = TextBox(self.ax_cmd, "", initial="Pick up the red cube",
+                                color=T['card'], hovercolor='#273449')
+        self.text_box.text_disp.set_color(T['text'])
+        self.text_box.text_disp.set_fontsize(12)
+        self.text_box.on_submit(lambda _t: self.on_analyze())
+        self.btn_analyze = self._button([0.49, 0.19, 0.09, 0.055], "Analyze", T['accent'], self.on_analyze)
+
+        # Ambiguity candidates (hidden until needed)
+        fig.text(0.62, 0.225, "", color=T['muted'], fontsize=9)
+        self.cand_buttons = []
+        for i in range(self.MAX_CANDIDATES):
+            ax = fig.add_axes([0.62 + i * 0.122, 0.19, 0.115, 0.055])
+            btn = Button(ax, "", color=T['card'], hovercolor='#273449')
+            btn.label.set_color(T['text'])
+            btn.on_clicked(lambda _e, i=i: self.on_candidate(i))
+            ax.set_visible(False)
+            self.cand_buttons.append((ax, btn))
+
+        # Zone row
+        fig.text(0.02, 0.115, "Place in", color=T['text'], fontsize=11, weight='bold')
+        self.zone_buttons = {}
+        for i, (dest, label) in enumerate(self.ZONE_BUTTONS):
+            if dest not in SPECIAL_DESTINATIONS and dest not in sim.sorting_zones:
+                continue
+            ax = fig.add_axes([0.10 + i * 0.081, 0.09, 0.075, 0.06])
+            btn = Button(ax, label, color=T['card'], hovercolor='#273449')
+            btn.label.set_color(OBJECT_HEX.get(label.lower(), T['text']))
+            btn.label.set_weight('bold')
+            btn.on_clicked(lambda _e, d=dest: self.on_zone(d))
+            self.zone_buttons[dest] = (ax, btn)
+
+        self.btn_execute = self._button([0.62, 0.085, 0.36, 0.07], "▶  Pick & Place", T['ok'], self.on_execute)
+        fig.text(0.02, 0.03, "Help: name a color (red, blue, green, yellow) and/or shape (cube, sphere, "
+                 "cylinder). Optional: '... in the blue zone' / 'throw it away'.  'clip: <text>' = free-form CLIP.",
+                 color=T['muted'], fontsize=9)
+
+        self.show_camera(self._safe_capture(), {}, None)
+        self.show_scores([], None, [])
+        self.set_status("Ready", "Type a command and press Enter or Analyze.", 'IDLE')
+
+    # -- widgets helpers --------------------------------------------------
+    def _button(self, rect, label, color, callback):
+        from matplotlib.widgets import Button
+        ax = self.fig.add_axes(rect)
+        btn = Button(ax, label, color=color, hovercolor=PANEL_THEME['text'])
+        btn.label.set_color(PANEL_THEME['bg'])
+        btn.label.set_weight('bold')
+        btn.label.set_fontsize(12)
+        btn.on_clicked(lambda _e: callback())
+        return btn
+
+    def _redraw(self):
+        self.fig.canvas.draw_idle()
+        try:
+            self.fig.canvas.flush_events()
+        except Exception:
+            pass
+
+    def _safe_capture(self):
+        try:
+            return self.sim.capture_camera_image()
+        except Exception:
+            return None
+
+    # -- drawing ----------------------------------------------------------
+    def show_camera(self, image, boxes, selected, candidates=()):
+        T, ax = PANEL_THEME, self.ax_cam
+        ax.clear()
+        ax.set_facecolor(T['card'])
+        if image is not None and not isinstance(image, str):
+            ax.imshow(image)
+        else:
+            ax.text(0.5, 0.5, "camera image unavailable", color=T['muted'],
+                    ha='center', va='center', transform=ax.transAxes)
+        import matplotlib.patches as patches
+        for name, (x1, y1, x2, y2) in (boxes or {}).items():
+            is_sel = name == selected
+            edge = T['gold'] if is_sel else _object_hex(name)
+            ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False,
+                                           edgecolor=edge, linewidth=3.5 if is_sel else 1.5,
+                                           linestyle='-' if (is_sel or name in candidates) else '--'))
+            ax.text(x1, y1 - 6, ("★ " if is_sel else "") + name, fontsize=9, color=T['bg'],
+                    weight='bold', bbox=dict(boxstyle="round,pad=0.25", facecolor=edge, edgecolor='none'))
+        ax.set_title("Robot camera  ·  segmentation boxes", color=T['text'], fontsize=11, loc='left')
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_color(T['edge'])
+
+    def show_scores(self, ranking, selected, candidates):
+        T, ax = PANEL_THEME, self.ax_scores
+        ax.clear()
+        ax.set_facecolor(T['card'])
+        ax.set_title("CLIP similarity (sorted)", color=T['text'], fontsize=11, loc='left')
+        if not ranking:
+            ax.text(0.5, 0.5, "no scores yet", color=T['muted'], ha='center', va='center',
+                    transform=ax.transAxes)
+            ax.set_xticks([]); ax.set_yticks([])
+        else:
+            names = [n for n, _ in ranking][::-1]
+            vals = [s for _, s in ranking][::-1]
+            colors = [_object_hex(n) for n in names]
+            alphas = [1.0 if (n == selected or n in candidates) else 0.35 for n in names]
+            bars = ax.barh(range(len(names)), vals, color=colors)
+            for bar, a, n in zip(bars, alphas, names):
+                bar.set_alpha(a)
+                if n == selected:
+                    bar.set_edgecolor(T['gold']); bar.set_linewidth(2.5)
+            ax.set_yticks(range(len(names)))
+            ax.set_yticklabels([("★ " if n == selected else "") + n for n in names],
+                               color=T['text'], fontsize=10)
+            for i, v in enumerate(vals):
+                ax.text(v + 0.01, i, f"{v:.3f}", va='center', color=T['text'], fontsize=9)
+            ax.set_xlim(0, max(1.0, max(vals) * 1.15))
+            ax.tick_params(axis='x', colors=T['muted'], labelsize=8)
+            ax.set_xlabel("relative softmax over visible crops (not calibrated confidence)",
+                          color=T['muted'], fontsize=8)
+        for sp in ax.spines.values():
+            sp.set_color(T['edge'])
+
+    def set_status(self, title, body, kind_key):
+        T, ax = PANEL_THEME, self.ax_status
+        ax.clear(); ax.set_axis_off()
+        color = T.get(STATUS_KIND.get(kind_key, 'muted'), T['muted'])
+        import matplotlib.patches as patches
+        ax.add_patch(patches.FancyBboxPatch((0, 0), 1, 1, boxstyle="round,pad=0.0,rounding_size=0.04",
+                                            transform=ax.transAxes, facecolor=T['card'],
+                                            edgecolor=color, linewidth=2))
+        ax.add_patch(patches.Rectangle((0, 0), 0.012, 1, transform=ax.transAxes, color=color))
+        ax.text(0.04, 0.80, title, color=color, fontsize=14, weight='bold', transform=ax.transAxes)
+        dest = self.destination or "—"
+        sel = self.selected or "—"
+        ax.text(0.04, 0.50, body, color=T['text'], fontsize=10, transform=ax.transAxes, wrap=True, va='center')
+        ax.text(0.04, 0.12, f"Object: {sel}     Destination: {dest}", color=T['muted'],
+                fontsize=10, transform=ax.transAxes)
+
+    def _refresh_zone_buttons(self):
+        for dest, (ax, btn) in self.zone_buttons.items():
+            active = dest == self.destination
+            ax.set_facecolor(PANEL_THEME['edge'] if active else PANEL_THEME['card'])
+            btn.color = PANEL_THEME['edge'] if active else PANEL_THEME['card']
+            for sp in ax.spines.values():
+                sp.set_color(PANEL_THEME['gold'] if active else PANEL_THEME['edge'])
+                sp.set_linewidth(2.5 if active else 1)
+
+    def _set_candidates(self, names):
+        for i, (ax, btn) in enumerate(self.cand_buttons):
+            if i < len(names):
+                btn.label.set_text(names[i])
+                btn.label.set_color(_object_hex(names[i]))
+                ax.set_visible(True)
+            else:
+                ax.set_visible(False)
+
+    # -- callbacks --------------------------------------------------------
+    def on_analyze(self):
+        if self.busy:
+            return
+        prompt = self.text_box.text
+        self.selected, self.destination = None, None
+        self._set_candidates([])
+        a = analyze_command(self.sim, prompt, self.catalog)
+        self.analysis = a
+        parsed, sel = a['parsed'], a['selection']
+        if parsed is not None and parsed.zone:
+            self.destination = parsed.zone
+        if a['camera_image'] is not None:
+            self.show_camera(a['camera_image'], a['bounding_boxes'], None, parsed.candidates if parsed else ())
+
+        if sel is None:
+            self.show_scores([], None, [])
+            msg = parsed.message if parsed and parsed.message else "No usable object crops."
+            self.set_status(f"Rejected · {a['status']}", msg + "\nNothing was moved.", 'NOT_IN_ZONE')
+        elif a['status'] == AMBIGUOUS:
+            names = [n for n, _ in sel.candidate_ranking][:self.MAX_CANDIDATES]
+            self.show_scores(sel.ranking, None, parsed.candidates)
+            self._set_candidates(names)
+            self.set_status("Ambiguous · choose one", sel.message[:160], AMBIGUOUS)
+        elif a['status'] == OK:
+            self.selected = sel.selected
+            self.show_scores(sel.ranking, sel.selected, parsed.candidates)
+            self.show_camera(a['camera_image'], a['bounding_boxes'], sel.selected, parsed.candidates)
+            note = "" if sel.clip_agrees else f"\nNote: {sel.message}"
+            nxt = "Press Pick & Place." if self.destination else "Choose a zone, then Pick & Place."
+            self.set_status(f"Selected · {sel.selected}", nxt + note, OK)
+        else:
+            self.show_scores(sel.ranking, None, parsed.candidates)
+            self.set_status(f"Rejected · {a['status']}", sel.message + "\nNothing was moved.", 'NOT_IN_ZONE')
+        self._refresh_zone_buttons()
+        self._redraw()
+
+    def on_candidate(self, i):
+        if self.busy or not self.analysis or not self.analysis['selection']:
+            return
+        sel = self.analysis['selection']
+        if i >= len(sel.candidate_ranking):
+            return
+        self.selected = sel.candidate_ranking[i][0]
+        self._set_candidates([])
+        self.show_scores(sel.ranking, self.selected, self.analysis['parsed'].candidates)
+        self.show_camera(self.analysis['camera_image'], self.analysis['bounding_boxes'], self.selected)
+        self.set_status(f"Selected · {self.selected}", "Chosen by you. Choose a zone, then Pick & Place.", OK)
+        self._refresh_zone_buttons()
+        self._redraw()
+
+    def on_zone(self, dest):
+        if self.busy:
+            return
+        self.destination = dest
+        self._refresh_zone_buttons()
+        if self.selected:
+            self.set_status(f"Ready · {self.selected} → {dest}", "Press Pick & Place to execute.", OK)
+        else:
+            self.set_status("Zone chosen", f"Destination {dest}. Analyze a command first.", 'IDLE')
+        self._redraw()
+
+    def on_execute(self):
+        if self.busy:
+            return
+        if not self.selected:
+            self.set_status("Nothing selected", "Analyze a valid command first.", 'UNVERIFIED')
+            self._redraw()
+            return
+        if not self.destination:
+            self.set_status("No zone", "Choose a placement zone first.", 'UNVERIFIED')
+            self._redraw()
+            return
+        self.busy = True
+        self.set_status("Robot executing…", f"{self.selected} → {self.destination}", 'BUSY')
+        self._redraw()
+        try:
+            _, grasped = pick_verified(self.sim, self.selected)
+            if not grasped:
+                self.set_status("Pick failed", "Grasp not verified; nothing was placed.", 'PICK_FAILED')
+            else:
+                status, pos = place_held_object(self.sim, self.selected, self.destination)
+                where = _fmt_pos(pos)
+                text = {"VERIFIED": f"Object is inside {self.destination} at {where}.",
+                        "NOT_IN_ZONE": f"Object ended at {where}, outside {self.destination}.",
+                        }.get(status, "Object pose could not be read; result unknown.")
+                self.set_status(f"Placement {status.replace('_', ' ')}", text, status)
+            self.show_camera(self._safe_capture(), {}, None)
+        finally:
+            self.busy = False
+            self.selected = None
+            self._redraw()
+
+    def show(self):
+        self.plt.show()
+
+
+def run_visual_panel_demo(sim):
+    """Open the visual control panel (blocks until the window is closed)."""
+    print("\n🖥️  Opening visual control panel... (close the window to finish)")
+    VisualControlPanel(sim).show()
 
 
 def analyze_full_scene_with_prompt(sim, prompt):

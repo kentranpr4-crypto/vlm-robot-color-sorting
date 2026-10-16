@@ -468,3 +468,44 @@ def test_real_clip_selection_headless():
             assert sel.selected == expected
     finally:
         sim.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Visual control panel (mode 3) driven through its callbacks, headless
+# ---------------------------------------------------------------------------
+
+def test_visual_panel_flow(csv_module, monkeypatch):
+    mpl = pytest.importorskip("matplotlib")
+    for name in ("matplotlib", "matplotlib.pyplot"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    mpl = importlib.import_module("matplotlib")
+    mpl.use("Agg")
+    import matplotlib.pyplot as real_plt
+
+    class Sim(FakeSim):
+        def capture_camera_image(self):
+            return None
+
+    sim = Sim(csv_module._positions)
+    gui = csv_module.VisualControlPanel(sim, real_plt)
+
+    gui.text_box.set_val("pick up the purple cube")
+    gui.on_analyze()
+    gui.on_execute()                                   # nothing selected -> no robot motion
+    assert gui.selected is None and picks(sim) == []
+
+    gui.text_box.set_val("pick up the ball")
+    gui.on_analyze()
+    assert gui.selected is None                        # ambiguous: user must choose
+    gui.on_candidate(0)
+    assert gui.selected in ("red_sphere", "green_sphere")
+
+    gui.text_box.set_val("Pick up the red cube")
+    gui.on_analyze()
+    assert gui.selected == "red_cube"
+    gui.on_execute()                                   # no zone yet -> refuses
+    assert picks(sim) == []
+    gui.on_zone("red_zone")
+    gui.on_execute()
+    assert picks(sim) == [("pick", "red_cube")]
+    real_plt.close(gui.fig)
