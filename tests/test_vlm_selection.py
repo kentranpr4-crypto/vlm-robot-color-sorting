@@ -262,11 +262,16 @@ def csv_module(monkeypatch):
     pb.stepSimulation = lambda: None
     pvs = types.ModuleType("panda_vision_simulation")
     pvs.VisionLanguagePandaSimulation = object
-    mpl = types.ModuleType("matplotlib")
-    plt = types.ModuleType("matplotlib.pyplot")
-    mpl.pyplot = plt
-    for name, mod in {"pybullet": pb, "panda_vision_simulation": pvs, "torch": types.ModuleType("torch"),
-                      "matplotlib": mpl, "matplotlib.pyplot": plt}.items():
+    stubs = {"pybullet": pb, "panda_vision_simulation": pvs, "torch": types.ModuleType("torch")}
+    try:  # real matplotlib (headless) when installed, stub otherwise
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot  # noqa: F401
+    except Exception:
+        mpl = types.ModuleType("matplotlib")
+        mpl.pyplot = types.ModuleType("matplotlib.pyplot")
+        stubs.update({"matplotlib": mpl, "matplotlib.pyplot": mpl.pyplot})
+    for name, mod in stubs.items():
         monkeypatch.setitem(sys.modules, name, mod)
     monkeypatch.delitem(sys.modules, "color_sorting_vlm", raising=False)
     mod = importlib.import_module("color_sorting_vlm")
@@ -475,12 +480,9 @@ def test_real_clip_selection_headless():
 # ---------------------------------------------------------------------------
 
 def test_visual_panel_flow(csv_module, monkeypatch):
-    mpl = pytest.importorskip("matplotlib")
-    for name in ("matplotlib", "matplotlib.pyplot"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
-    mpl = importlib.import_module("matplotlib")
-    mpl.use("Agg")
-    import matplotlib.pyplot as real_plt
+    real_plt = sys.modules.get("matplotlib.pyplot")
+    if real_plt is None or not hasattr(real_plt, "figure"):
+        pytest.skip("matplotlib not installed")
 
     class Sim(FakeSim):
         def capture_camera_image(self):

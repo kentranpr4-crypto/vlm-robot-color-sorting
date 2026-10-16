@@ -344,12 +344,25 @@ def ask_destination(sim, ask=input):
 
 
 def execute_placement(sim, object_name, destination):
+    """
+    Prefer the simulator's own verified placement API where it covers the
+    destination (color-matched zone, safe table spot); otherwise use this
+    demo's motion helpers. Returns the controller's bool, or None when the
+    helper has no return value. The final result is still decided by
+    verify_placement() from the simulator state.
+    """
+    color, _ = split_object_name(object_name)
+    if destination == f"{color}_zone" and hasattr(sim, 'place_object_in_sorting_zone'):
+        return sim.place_object_in_sorting_zone(object_name)
+    if destination == "safe" and hasattr(sim, 'place_object'):
+        return sim.place_object()
     if destination in sim.sorting_zones:
         place_object_in_specific_zone(sim, object_name, destination)
     elif destination == "throw":
         throw_object_away(sim, object_name)
     else:
         safe_place_object(sim, object_name)
+    return None
 
 
 def analyze_command(sim, prompt, catalog):
@@ -424,7 +437,9 @@ def pick_verified(sim, selected):
     print(f"🤖 Picking up {selected}...")
     before = get_object_position(sim, selected)
     if not sim.pick_object(selected):
-        print(panel("Pick failed", [f"sim.pick_object('{selected}') returned False."], kind="error"))
+        reason = getattr(sim, 'last_error', '')
+        print(panel("Pick failed", [f"sim.pick_object('{selected}') returned False."]
+                    + ([f"Reason: {reason}"] if reason else []), kind="error"))
         return False, False
     after = get_object_position(sim, selected)
     if before is not None and after is not None and not is_lifted(before, after):
@@ -443,7 +458,10 @@ def place_held_object(sim, selected, destination):
     motion call returning). Returns (placement_status, position).
     """
     print(f"🚚 Moving {paint_object(selected)} → {S(destination, 'bold')}")
-    execute_placement(sim, selected, destination)
+    controller = execute_placement(sim, selected, destination)
+    if controller is False:
+        reason = getattr(sim, 'last_error', '') or 'no reason given'
+        print(S(f"   ! Controller reported a placement failure: {reason}", "yellow"))
     settle()
 
     status, pos = verify_placement(sim, selected, destination)
