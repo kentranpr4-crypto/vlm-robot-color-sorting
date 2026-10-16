@@ -36,9 +36,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from transformers import CLIPProcessor, CLIPModel
 from typing import Dict, List, Tuple, Optional
+from simple_pick_place_demo import PandaRobotSimulation
 
 
-class VisionLanguagePandaSimulation:
+class VisionLanguagePandaSimulation(PandaRobotSimulation):
     """
     A class that combines Panda robot simulation with CLIP vision-language understanding
     for intelligent object selection and manipulation.
@@ -52,16 +53,14 @@ class VisionLanguagePandaSimulation:
             gui_mode (bool): Whether to run simulation with GUI or headless
             model_name (str): Name of the CLIP model to use
         """
-        # Initialize PyBullet simulation
-        if gui_mode:
-            self.physics_client = p.connect(p.GUI)
-        else:
-            self.physics_client = p.connect(p.DIRECT)
-        
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        
+        super().__init__(gui_mode=gui_mode)
+
         # Initialize CLIP vision-language model
-        self._initialize_clip(model_name)
+        try:
+            self._initialize_clip(model_name)
+        except Exception:
+            super().cleanup()
+            raise
         
         # Simulation objects
         self.robot_id = None
@@ -80,7 +79,7 @@ class VisionLanguagePandaSimulation:
         self.camera_height = 480
         
         # Workspace positions
-        self.home_position = [0.3, 0.0, 0.85]
+        self.home_position = [0.3, 0.0, 0.95]
         self.place_position = [0.2, 0.3, 0.6]  # Where to place selected objects
         
         # Color sorting zones - left and right of robot
@@ -128,28 +127,8 @@ class VisionLanguagePandaSimulation:
         """
         print("Setting up simulation environment...")
         
-        # Set gravity
-        p.setGravity(0, 0, -9.81)
-        
-        # Load ground plane
-        ground_plane_id = p.loadURDF("plane.urdf")
-        
-        # Load and position the table
-        table_position = [0.5, 0, 0.0]
-        table_orientation = p.getQuaternionFromEuler([0, 0, 0])
-        self.table_id = p.loadURDF("table/table.urdf", 
-                                  table_position, 
-                                  table_orientation,
-                                  globalScaling=1.0)
-        
-        # Load the Panda robot arm
-        robot_position = [0.0, 0.0, 0.626]  # On table surface
-        robot_orientation = p.getQuaternionFromEuler([0, 0, 0])
-        self.robot_id = p.loadURDF("franka_panda/panda.urdf", 
-                                  robot_position, 
-                                  robot_orientation,
-                                  useFixedBase=True)
-        
+        self._setup_world()
+
         # Create multiple objects for selection
         self.create_multiple_objects()
         
@@ -170,7 +149,7 @@ class VisionLanguagePandaSimulation:
         # Object parameters
         object_size = 0.05  # 5cm
         object_mass = 0.1   # 100g
-        table_surface_z = 0.65  # Height of table surface (slightly lower to ensure contact)
+        table_surface_z = self.table_height + object_size / 2 + 0.002
         
         # Define different objects with positions and colors
         object_configs = [
@@ -261,6 +240,7 @@ class VisionLanguagePandaSimulation:
                                      basePosition=config['position'],
                                      baseOrientation=p.getQuaternionFromEuler([0, 0, 0]))
         
+        self._configure_object(object_id)
         return object_id
         
     def create_sorting_zones(self):
@@ -706,253 +686,44 @@ class VisionLanguagePandaSimulation:
         plt.show()
         
     # Robot movement methods (adapted from original simulation)
-    def set_initial_robot_pose(self):
-        """Set the robot to a safe initial pose."""
-        initial_joint_positions = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
-        
-        for i in range(7):
-            p.setJointMotorControl2(self.robot_id, i,
-                                  p.POSITION_CONTROL,
-                                  targetPosition=initial_joint_positions[i],
-                                  force=500)
-        
-        for _ in range(480):
-            p.stepSimulation()
-            time.sleep(1./240.)
-            
-        print("Robot set to initial safe pose")
-        
-    def move_to_position(self, target_position, target_orientation=None):
-        """Move the robot end-effector to a target position."""
-        if target_orientation is None:
-            target_orientation = p.getQuaternionFromEuler([np.pi, 0, 0])
-        
-        joint_positions = p.calculateInverseKinematics(
-            self.robot_id,
-            endEffectorLinkIndex=11,
-            targetPosition=target_position,
-            targetOrientation=target_orientation,
-            maxNumIterations=100,
-            residualThreshold=1e-5
-        )
-        
-        for i in range(7):
-            p.setJointMotorControl2(self.robot_id, i,
-                                  p.POSITION_CONTROL,
-                                  targetPosition=joint_positions[i],
-                                  force=500,
-                                  maxVelocity=1.0)
-        
-        self.wait_for_movement()
-        
-    def safe_move_to_position(self, target_position, target_orientation=None, min_height=0.9):
-        """
-        Move the robot end-effector to a target position with safe intermediate waypoint.
-        This prevents the robot from going too low during horizontal movements.
-        
-        Args:
-            target_position (list): Target [x, y, z] position
-            target_orientation: Target orientation (optional)
-            min_height (float): Minimum safe height during movement
-        """
-        if target_orientation is None:
-            target_orientation = p.getQuaternionFromEuler([np.pi, 0, 0])
-        
-        # Get current end-effector position
-        current_pos = p.getLinkState(self.robot_id, 11)[0]
-        
-        # If either current or target position is below safe height, use intermediate waypoint
-        if current_pos[2] < min_height or target_position[2] < min_height:
-            # Create intermediate waypoint at safe height
-            waypoint_pos = [target_position[0], target_position[1], max(min_height, target_position[2])]
-            
-            print(f"   Using safe waypoint at height {waypoint_pos[2]:.2f}m")
-            
-            # Move to safe waypoint first
-            joint_positions = p.calculateInverseKinematics(
-                self.robot_id,
-                endEffectorLinkIndex=11,
-                targetPosition=waypoint_pos,
-                targetOrientation=target_orientation,
-                maxNumIterations=100,
-                residualThreshold=1e-5
-            )
-            
-            for i in range(7):
-                p.setJointMotorControl2(self.robot_id, i,
-                                      p.POSITION_CONTROL,
-                                      targetPosition=joint_positions[i],
-                                      force=500,
-                                      maxVelocity=1.0)
-            
-            self.wait_for_movement()
-        
-        # Now move to final target position
-        self.move_to_position(target_position, target_orientation)
-        
-    def control_gripper(self, position):
-        """Control the gripper opening/closing."""
-        # Set both gripper joints
-        p.setJointMotorControl2(self.robot_id, 9,
-                              p.POSITION_CONTROL,
-                              targetPosition=position,
-                              force=200,  # Increased force for better grip
-                              maxVelocity=0.5)
-        p.setJointMotorControl2(self.robot_id, 10,
-                              p.POSITION_CONTROL,
-                              targetPosition=position,
-                              force=200,  # Increased force for better grip
-                              maxVelocity=0.5)
-        
-        # Wait for gripper to reach position
-        for _ in range(120):  # 0.5 seconds
-            p.stepSimulation()
-            time.sleep(1./240.)
-        
-    def wait_for_movement(self, timeout=5.0):
-        """Wait for robot movement to complete."""
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout:
-            p.stepSimulation()
-            time.sleep(1./240.)
-            
-            if time.time() - start_time > 3.0:
-                break
-                
+    # Motion, gripper control, and settling use the same tested controller as
+    # simple_pick_place_demo. Existing method names and call signatures remain.
     def pick_object(self, object_name):
-        """
-        Pick up a specific object.
-        
-        Args:
-            object_name (str): Name of the object to pick
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
+        """Return True only after a sustained physical lift with both fingers."""
         if object_name not in self.objects:
-            print(f"Object '{object_name}' not found!")
-            return False
-            
-        obj_info = self.objects[object_name]
-        obj_pos, _ = p.getBasePositionAndOrientation(obj_info['id'])
-        
-        print(f"Picking up {object_name} at position {obj_pos}")
-        print(f"Object height: {obj_pos[2]:.3f}m, Object size: {obj_info['config']['size']:.3f}m")
-        
-        # Move to home position first
-        print("Moving to home position...")
-        self.move_to_position(self.home_position)
-        
-        # Open gripper
-        print("Opening gripper...")
-        self.control_gripper(self.gripper_open_position)
-        
-        # Approach object from above (higher to avoid collisions)
-        print(f"Approaching {object_name}...")
-        approach_pos = [obj_pos[0], obj_pos[1], obj_pos[2] + 0.25]  # Increased from 0.15 to 0.25
-        self.move_to_position(approach_pos)
-        
-        # Lower to object - go down to the actual object surface level
-        print(f"Lowering to {object_name}...")
-        pick_pos = [obj_pos[0], obj_pos[1], obj_pos[2] + 0.01]  # Much closer to object surface
-        self.move_to_position(pick_pos)
-        
-        # Close gripper
-        print(f"Grasping {object_name}...")
-        self.control_gripper(self.gripper_close_position)
-        
-        # Wait a moment to ensure good grip
-        print("Ensuring secure grip...")
-        for _ in range(60):  # Quarter second pause
-            p.stepSimulation()
-            time.sleep(1./240.)
-        
-        # Lift object higher to avoid table collisions during transport
-        print(f"Lifting {object_name}...")
-        lift_pos = [obj_pos[0], obj_pos[1], obj_pos[2] + 0.30]  # Increased from 0.15 to 0.30
-        self.move_to_position(lift_pos)
-        
-        return True
-        
+            return self._fail(f"Object '{object_name}' not found")
+        return self._pick_body(self.objects[object_name]['id'])
+
     def place_object(self):
-        """Place the currently held object at the predefined place position."""
-        print("Placing object...")
-        
-        # Move to place approach position (higher up to avoid table collision)
-        place_approach = [self.place_position[0], self.place_position[1], self.place_position[2] + 0.20]  # Increased height
-        self.move_to_position(place_approach)
-        
-        # Lower to place position
-        place_target = [self.place_position[0], self.place_position[1], self.place_position[2] + 0.05]  # Higher placement
-        self.move_to_position(place_target)
-        
-        # Release object
-        print("Releasing object...")
-        self.control_gripper(self.gripper_open_position)
-        
-        # Retreat with extra height
-        retreat_pos = [self.place_position[0], self.place_position[1], self.place_position[2] + 0.20]  # Higher retreat
-        self.move_to_position(retreat_pos)
-        
-        # Return to home
-        print("Returning to home position...")
-        self.move_to_position(self.home_position)
-        
+        """Release on the table and verify its final position and support."""
+        return self._place_body(self.place_position[:2], self.table_id)
+
     def place_object_in_sorting_zone(self, object_name):
-        """
-        Place the currently held object in the appropriate color sorting zone.
-        
-        Args:
-            object_name (str): Name of the object to determine target zone
-        """
-        print(f"Placing {object_name} in appropriate sorting zone...")
-        
-        # Determine target zone based on object color
-        target_zone = None
-        if 'red' in object_name.lower():
-            target_zone = 'red_zone'
-        elif 'blue' in object_name.lower():
-            target_zone = 'blue_zone'
-        elif 'green' in object_name.lower():
-            target_zone = 'green_zone'
-        elif 'yellow' in object_name.lower():
-            target_zone = 'yellow_zone'
-        
-        if target_zone is None:
-            print(f"   Warning: No matching zone found for {object_name}, using default position")
-            self.place_object()
-            return
-        
-        # Get target zone position
-        zone_config = self.sorting_zones[target_zone]
-        zone_position = zone_config['position']
-        zone_color = target_zone.replace('_zone', '').upper()
-        
-        print(f"   Target zone: {zone_color} at {zone_position}")
-        
-        # Move safely to zone approach position (using safe waypoint movement)
-        zone_approach = [zone_position[0], zone_position[1], zone_position[2] + 0.25]  # Increased from 0.20 to 0.25
-        print(f"   Moving safely to approach position...")
-        self.safe_move_to_position(zone_approach)
-        
-        # Lower to zone surface (just above the colored zone)
-        zone_target = [zone_position[0], zone_position[1], zone_position[2] + 0.05]  # Higher above zone
-        self.move_to_position(zone_target)
-        
-        # Release object
-        print(f"   Releasing {object_name} in {zone_color} zone...")
-        self.control_gripper(self.gripper_open_position)
-        
-        # Retreat with extra height using safe movement
-        retreat_pos = [zone_position[0], zone_position[1], zone_position[2] + 0.25]  # Increased from 0.20 to 0.25
-        print(f"   Retreating safely...")
-        self.move_to_position(retreat_pos)
-        
-        # Return to home
-        print("   Returning to home position...")
-        self.move_to_position(self.home_position)
-        
+        """Place the verified held object in its matching physical zone."""
+        if object_name not in self.objects:
+            return self._fail(f"Object '{object_name}' not found")
+        if self.held_object_id != self.objects[object_name]['id']:
+            return self._fail(f"The gripper is not holding {object_name}")
+        zone_name = self._get_target_zone_for_object(object_name)
+        if zone_name not in self.sorting_zones:
+            return self.place_object()
+        zone = self.sorting_zones[zone_name]
+        # Keep successive objects side by side instead of dropping onto one another.
+        # The fingers open along Y, so keep placement centered between the Y borders.
+        size = self.objects[object_name]['config']['size']
+        offset = zone['size'][0] / 2 - size / 2 - 0.01
+        for direction in (-1, 1):
+            xy = np.array(zone['position'][:2], dtype=float)
+            xy[0] += direction * offset
+            occupied = any(
+                other['id'] != self.held_object_id
+                and np.linalg.norm(self._object_position(other['id'])[:2] - xy)
+                < (size + other['config']['size']) / 2 + 0.005
+                for other in self.objects.values())
+            if not occupied:
+                return self._place_body(xy, self.zone_ids[zone_name], xy_tolerance=0.02)
+        return self._fail(f"No free placement slot in {zone_name}")
+
     def run_vision_guided_pick_and_place(self, text_prompt, visualize=True):
         """
         Execute a complete vision-guided pick and place operation.
@@ -1011,8 +782,8 @@ class VisionLanguagePandaSimulation:
         success = self.pick_object(selected_object)
         
         if success:
-            self.place_object_in_sorting_zone(selected_object)
-            print(f"✓ Successfully completed pick and place for '{text_prompt}'!")
+            success = self.place_object_in_sorting_zone(selected_object)
+            print(f"Pick and place success: {success}")
         else:
             print(f"✗ Failed to pick up {selected_object}")
         
@@ -1065,7 +836,7 @@ class VisionLanguagePandaSimulation:
         
     def cleanup(self):
         """Clean up and disconnect from PyBullet."""
-        p.disconnect()
+        super().cleanup()
         print("Simulation ended.")
     
     def run_color_sorting_demo(self, visualize=True):
@@ -1143,15 +914,15 @@ class VisionLanguagePandaSimulation:
             
             # Step 3: Place in appropriate sorting zone
             print(f"3. Placing {object_name} in color-matched zone...")
-            self.place_object_in_sorting_zone(object_name)
+            success = self.place_object_in_sorting_zone(object_name)
             
             results.append({
                 'object_name': object_name,
-                'success': True,
+                'success': success,
                 'target_zone': self._get_target_zone_for_object(object_name)
             })
             
-            print(f"   ✓ Successfully sorted {object_name}!")
+            print(f"   Placement verified for {object_name}: {success}")
             
             # Pause between objects
             if i < len(available_objects) - 1:
