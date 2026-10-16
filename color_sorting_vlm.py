@@ -5,14 +5,23 @@ Vision-Language Color Sorting Demonstration
 This script demonstrates automated color sorting using the Panda robot and a vision-language model (CLIP).
 The robot identifies colored objects using CLIP and sorts them into matching colored zones.
 
+This is a pretrained VLM (CLIP, zero-shot) used for object *selection*, combined
+with a programmed robot controller. It is not an end-to-end trained VLA policy.
+
+Pipeline (interactive mode):
+    user text -> command validation (vlm_helpers.parse_command)
+              -> camera image + segmentation crops (sim.capture_and_process_scene)
+              -> CLIP similarity (sim.compute_object_similarity)
+              -> selected object (vlm_helpers.select_target)
+              -> sim.pick_object(name) -> placement zone -> verification in sim
+
 Features:
-- 5+ colored objects (e.g. red cube, blue cube, blue sphere, green sphere, yellow cylinder)
+- 5 colored objects (red cube, red sphere, blue cube, green sphere, yellow cylinder)
 - 4 colored sorting zones (2 on left, 2 on right of robot)
 - Vision-language (CLIP) based object identification and selection
 - Automated color matching and placement
-- Interactive text prompt mode for custom selection
-- Visual feedback showing sorting progress
-- Complete pick-and-place operations for each object
+- Interactive text prompt mode with command validation
+- Placement verified from the simulator state (not from the motion call returning)
 
 Usage:
     python3 color_sorting_vlm.py
@@ -24,72 +33,82 @@ import time
 import matplotlib.pyplot as plt
 import torch
 
+from vlm_helpers import (
+    AMBIGUOUS, OK, NO_OBJECTS, ZONE_MENU, FREEFORM_PREFIX, SHAPE_SYNONYMS,
+    SUPPORTED_COLORS, Style, banner, panel, rule, score_table, paint_object,
+    parse_command, validate_crops, select_target, parse_zone_choice,
+    zone_side, verify_in_zone, is_lifted, describe_catalog, example_commands,
+    split_object_name,
+)
+
+S = Style.s
+MAX_ZONE_ATTEMPTS = 3
+
 
 def main():
     """
     Run the color sorting demonstration.
     """
-    print("🎨 Color Sorting Demonstration")
-    print("=" * 40)
-    print("Choose your demo mode:")
-    print("1. 🎨 Automatic Color Sorting (sort all objects by color)")
-    print("2. 🎯 Interactive Text Prompts (enter custom prompts)")
+    print(banner("VLM Robot Color Sorting", "CLIP (openai/clip-vit-base-patch32) + Franka Panda"))
     print()
-    
-    choice = input("Select mode (1/2, default=1): ").strip()
-    
-    print("\nThe robot will work with these objects and zones:")
-    print("• Objects: Red cube, blue cube, green sphere, yellow cylinder")
-    print("• Zones: Red zone (left front), Blue zone (left back)")
-    print("         Green zone (right front), Yellow zone (right back)")
+    print(S("  Choose your demo mode:", "bold"))
+    print(f"   {S('1', 'bold', 'cyan')}  Automatic color sorting  {S('(sort all objects by color)', 'gray')}")
+    example = S('(e.g. "Pick up the red cube")', 'gray')
+    print(f"   {S('2', 'bold', 'cyan')}  Interactive text prompts {example}")
     print()
-    
+
+    choice = input(S("  Select mode (1/2, default=1): ", "bold")).strip()
+    if choice not in ("", "1", "2"):
+        print(S(f"  Unknown mode '{choice}', using 1 (automatic).", "yellow"))
+        choice = "1"
+
     # Create simulation (using CLIP model for fast processing)
     sim = VisionLanguagePandaSimulation(
-        gui_mode=True, 
+        gui_mode=True,
         model_name="openai/clip-vit-base-patch32"
     )
-    
+
     try:
         # Setup simulation environment with sorting zones
         print("Setting up simulation environment...")
         sim.setup_simulation()
-        
+
         # Wait for physics to settle
         for _ in range(240):
             p.stepSimulation()
             time.sleep(1./240.)
-        
+
         # Set robot to initial pose
         sim.set_initial_robot_pose()
-        
+
+        print()
+        print(scene_overview(sim))
+
         # Show initial scene
         print("\nShowing initial scene with objects and sorting zones...")
         initial_image = sim.capture_camera_image()
-        
+
         fig, ax = plt.subplots(1, 1, figsize=(12, 8))
         ax.imshow(initial_image)
         ax.set_title("Initial Scene - Objects and Color Sorting Zones")
         ax.axis('off')
-        
-        # Add annotations for sorting zones
+
+        # Zone annotations derived from the simulator configuration (robot frame)
         zone_annotations = [
-            "RED ZONE\n(right front)",
-            "BLUE ZONE\n(left front)", 
-            "GREEN ZONE\n(right back)",
-            "YELLOW ZONE\n(left back)"
+            f"{zone.replace('_zone', '').upper()} ZONE\n({zone_side(cfg['position'])}, robot view)"
+            for zone, cfg in sim.sorting_zones.items()
         ]
-        
+
         # Add text annotations (approximate positions)
-        ax.text(50, 50, "SORTING ZONES:", fontsize=14, weight='bold', 
+        ax.text(50, 50, "SORTING ZONES:", fontsize=14, weight='bold',
                 bbox=dict(boxstyle="round,pad=0.5", facecolor='white', alpha=0.8))
         for i, annotation in enumerate(zone_annotations):
-            ax.text(50, 100 + i*30, f"• {annotation}", fontsize=10,
+            ax.text(50, 100 + i*40, f"• {annotation}", fontsize=10,
                     bbox=dict(boxstyle="round,pad=0.3", facecolor='lightgray', alpha=0.7))
-        
+
         plt.tight_layout()
         plt.show()
-        
+
         # Run selected demo mode
         if choice == "2":
             # Interactive text prompts only
@@ -98,22 +117,11 @@ def main():
             # Automatic color sorting (default)
             print("\n🎨 Starting automatic color sorting...")
             results = sim.run_color_sorting_demo(visualize=True)
-            
-            # Final summary for auto mode
-            successful_sorts = sum(1 for r in results if r['success'])
-            print(f"\n{'='*50}")
-            print(f"🎉 COLOR SORTING COMPLETE!")
-            print(f"{'='*50}")
-            print(f"Successfully sorted: {successful_sorts}/{len(results)} objects")
-            
-            if successful_sorts == len(results):
-                print("🏆 Perfect sorting! All objects placed in correct zones.")
-            else:
-                print("⚠️  Some objects could not be sorted correctly.")
-        
+            report_sorting_results(sim, results)
+
         print("\nPress Enter to exit...")
         input()
-        
+
     except KeyboardInterrupt:
         print("\nColor sorting interrupted by user.")
     except Exception as e:
@@ -124,226 +132,161 @@ def main():
         sim.cleanup()
 
 
+# ---------------------------------------------------------------------------
+# Scene / verification helpers (read simulator state, never move the robot)
+# ---------------------------------------------------------------------------
+
+def scene_overview(sim):
+    """Panel listing the objects and zones that actually exist in the simulator."""
+    lines = [S("Objects:", "bold")]
+    for name in sim.objects:
+        lines.append(f"  • {paint_object(name)}")
+    lines.append(S("Zones (robot frame: base at origin, facing +x):", "bold"))
+    for zone, cfg in sim.sorting_zones.items():
+        x, y, _ = cfg['position']
+        lines.append(f"  • {paint_object(zone)}  {S(zone_side(cfg['position']), 'gray')}"
+                     f"  {S(f'(x={x:+.2f}, y={y:+.2f})', 'gray')}")
+    return panel("Scene", lines, kind="info")
+
+
+def get_object_position(sim, object_name):
+    """Ground-truth object position from PyBullet, or None if unavailable."""
+    try:
+        pos, _ = p.getBasePositionAndOrientation(sim.objects[object_name]['id'])
+        return tuple(pos)
+    except Exception:
+        return None
+
+
+def settle(steps=120):
+    for _ in range(steps):
+        p.stepSimulation()
+        time.sleep(1./240.)
+
+
+def verify_placement(sim, object_name, destination):
+    """
+    Check where the object really ended up.
+
+    Returns (status, position) with status one of
+    'VERIFIED', 'NOT_IN_ZONE', 'UNVERIFIED'.
+    """
+    pos = get_object_position(sim, object_name)
+    if pos is None:
+        return "UNVERIFIED", None
+    if destination in sim.sorting_zones:
+        ok = verify_in_zone(pos, sim.sorting_zones[destination])
+    elif destination == "throw":
+        ok = pos[2] < 0.4            # fell off the table onto the floor
+    elif destination == "safe":
+        tx, ty = sim.place_position[0], sim.place_position[1]
+        ok = abs(pos[0] - tx) <= 0.1 and abs(pos[1] - ty) <= 0.1 and pos[2] >= 0.55
+    else:
+        return "UNVERIFIED", pos
+    return ("VERIFIED" if ok else "NOT_IN_ZONE"), pos
+
+
+def _fmt_pos(pos):
+    return "unknown" if pos is None else f"({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:.3f})"
+
+
+def report_sorting_results(sim, results):
+    """Auto-mode summary: controller-reported result vs. verified final position."""
+    print()
+    print(rule("═"))
+    print(S("  COLOR SORTING RESULT (verified from simulator state)", "bold"))
+    print(rule("═"))
+    verified = 0
+    for r in results:
+        name = r['object_name']
+        color, _ = split_object_name(name)
+        target = f"{color}_zone" if color else None
+        claimed = "moved" if r.get('success') else "failed"
+        if target in sim.sorting_zones and r.get('success'):
+            status, pos = verify_placement(sim, name, target)
+        else:
+            status, pos = ("NOT_IN_ZONE" if r.get('success') else "FAILED"), get_object_position(sim, name)
+        verified += status == "VERIFIED"
+        mark = {"VERIFIED": S("✔ VERIFIED", "green", "bold"),
+                "NOT_IN_ZONE": S("✖ NOT IN ZONE", "red", "bold"),
+                "FAILED": S("✖ FAILED", "red", "bold")}.get(status, S("? UNVERIFIED", "yellow"))
+        label = paint_object(name) + " " * max(0, 16 - len(name))
+        print(f"  {label} → {target or '?':<12} controller: {claimed:<7} {mark}  {S(_fmt_pos(pos), 'gray')}")
+    print(rule())
+    total = len(results)
+    if total and verified == total:
+        print(S(f"  🏆 {verified}/{total} objects verified inside their matching zone.", "green", "bold"))
+    else:
+        print(S(f"  ⚠️  {verified}/{total} objects verified inside their matching zone.", "yellow", "bold"))
+
+
+# ---------------------------------------------------------------------------
+# Interactive mode
+# ---------------------------------------------------------------------------
+
+def interactive_help(catalog):
+    lines = [
+        S("Say what to pick, by color and/or shape:", "bold"),
+        *[f"  {S('›', 'cyan')} {ex}" for ex in example_commands(catalog)],
+        "",
+        S("Optional placement in the same command:", "bold"),
+        f"  {S('›', 'cyan')} Pick up the red cube and put it in the blue zone",
+        f"  {S('›', 'cyan')} Pick up the yellow cylinder and throw it away",
+        "",
+        f"Colors: {', '.join(SUPPORTED_COLORS)}   Shapes: {', '.join(SHAPE_SYNONYMS)}"
+        f" {S('(ball, box, block, can… also understood)', 'gray')}",
+        f"Free-form CLIP (no validation): {S(FREEFORM_PREFIX + ' something round', 'cyan')}",
+        f"Commands: {S('help', 'cyan')}, {S('quit', 'cyan')}",
+    ]
+    return panel("Interactive text prompts", lines, kind="info")
+
+
 def run_interactive_text_prompt_demo(sim):
     """
     Run an interactive demo where the user can enter text prompts
     to select and manipulate objects.
-    
+
     Args:
         sim: VisionLanguagePandaSimulation instance
     """
-    print(f"\n{'='*60}")
-    print(f"🎯 INTERACTIVE TEXT PROMPT DEMO")
-    print(f"{'='*60}")
-    print("Enter text prompts to select objects for the robot to pick up!")
-    print("Available objects: red_cube, blue_cube, green_sphere, yellow_cylinder")
-    print("Example prompts:")
-    print("  • 'red cube'")
-    print("  • 'blue object'") 
-    print("  • 'round thing'")
-    print("  • 'yellow cylinder'")
-    print("  • 'something green'")
-    print("  • 'pick up the color with most amount of objects' (try full scene!)")
+    catalog = list(sim.objects.keys())
     print()
-    print("ANALYSIS MODES:")
-    print("• Type 'full:' before your prompt to use full scene analysis")
-    print("• Example: 'full: pick the color with most objects'")
-    print("• Regular prompts use individual object analysis")
-    print()
-    print("Type 'quit' or 'exit' to stop")
-    print(f"{'='*60}")
-    
+    print(interactive_help(catalog))
+
     while True:
         try:
             # Get user input
-            prompt = input("\n🤖 Enter your prompt: ").strip()
-            
+            prompt = input(f"\n{S('🤖 Command', 'bold', 'cyan')} {S('›', 'cyan')} ").strip()
+
             # Check for exit commands
             if prompt.lower() in ['quit', 'exit', 'q']:
                 print("👋 Exiting interactive demo...")
                 break
-            
-            # Skip empty prompts
-            if not prompt:
-                print("⚠️  Please enter a valid prompt!")
+            if prompt.lower() in ['help', '?', 'h']:
+                print(interactive_help(catalog))
                 continue
-            
-            print(f"\n🔍 Processing prompt: '{prompt}'")
-            
-            # Check if user wants full scene analysis
-            # use_full_scene = prompt.lower().startswith('full:')
-            # if use_full_scene:
-            #     actual_prompt = prompt[5:].strip()  # Remove 'full:' prefix
-            #     print(f"🌟 Using FULL SCENE analysis for: '{actual_prompt}'")
-            #     
-            #     # Analyze full scene
-            #     scene_analysis = analyze_full_scene_with_prompt(sim, actual_prompt)
-            #     
-            #     print(f"\n📋 Full Scene Analysis Results:")
-            #     print(f"   Method: {scene_analysis['method']}")
-            #     print(f"   Analysis: {scene_analysis['analysis']}")
-            #     
-            #     if scene_analysis.get('scene_scores'):
-            #         print(f"\n📊 Scene-based Scores:")
-            #         for obj_name, score in scene_analysis['scene_scores'].items():
-            #             bar = "█" * int(score * 20)
-            #             print(f"     {obj_name:15}: {score:.3f} {bar}")
-            #     
-            #     recommended_object = scene_analysis['recommended_object']
-            #     confidence = scene_analysis['confidence']
-            #     
-            #     if recommended_object:
-            #         print(f"\n🎯 Full Scene Recommendation: {recommended_object} (confidence: {confidence:.3f})")
-            #         
-            #         # Ask if user wants to proceed with recommendation
-            #         proceed = input(f"Use full scene recommendation '{recommended_object}'? (y/n/compare): ").lower()
-            #         
-            #         if proceed == 'compare':
-            #             print(f"\n🔄 COMPARISON MODE: Full Scene vs Individual Crops")
-            #             print("=" * 50)
-            #             
-            #             # Show both analyses
-            #             print(f"🌟 Full Scene Result: {recommended_object} ({confidence:.3f})")
-            #             
-            #             # Now do individual crop analysis for comparison using segmentation
-            #             print(f"\n🔍 Individual Crop Analysis for comparison (with segmentation)...")
-            #             comparison_camera_image, comparison_bboxes, comparison_crops = sim.capture_and_process_scene()
-            #             crop_scores = sim.compute_object_similarity(comparison_crops, actual_prompt)
-            #             
-            #             print(f"\n📊 Individual Crop Scores:")
-            #             sorted_scores = sorted(crop_scores.items(), key=lambda x: x[1], reverse=True)
-            #             for obj_name, score in sorted_scores:
-            #                 bar = "█" * int(score * 20)
-            #                 print(f"     {obj_name:15}: {score:.3f} {bar}")
-            #             
-            #             crop_winner, crop_score = sim.select_best_object(crop_scores)
-            #             print(f"\n� Individual Crop Winner: {crop_winner} ({crop_score:.3f})")
-            #             
-            #             print(f"\n🤔 COMPARISON SUMMARY:")
-            #             print(f"   Full Scene:      {recommended_object} ({confidence:.3f})")
-            #             print(f"   Individual Crop: {crop_winner} ({crop_score:.3f})")
-            #             
-            #             if recommended_object == crop_winner:
-            #                 print(f"   ✅ Both methods agree!")
-            #             else:
-            #                 print(f"   ⚠️  Methods disagree - which shows the difference!")
-            #             
-            #             # Let user choose which result to use
-            #             choice = input(f"\nWhich result to use? (f=full scene, c=crop, n=none): ").lower()
-            #             if choice == 'f':
-            #                 selected_object, best_score = recommended_object, confidence
-            #             elif choice == 'c':
-            #                 selected_object, best_score = crop_winner, crop_score
-            #             else:
-            #                 print("🚫 Operation cancelled.")
-            #                 continue
-            #                 
-            #         elif proceed in ['y', 'yes', '']:
-            #             selected_object, best_score = recommended_object, confidence
-            #         else:
-            #             print("🚫 Operation cancelled.")
-            #             continue
-            #     else:
-            #         print("❌ Full scene analysis couldn't determine a good object!")
-            #         continue
-                    
-            # Regular individual crop analysis with improved segmentation
-            print("🔍 Using INDIVIDUAL CROP analysis with segmentation masks")
-            
-            # Use new segmentation-based capture and processing
-            print("📸 Capturing scene with segmentation...")
-            camera_image, bounding_boxes, crops = sim.capture_and_process_scene()
-            
-            if not bounding_boxes:
-                print("❌ No objects detected in scene!")
-                continue
-            
-            # Compute similarity scores using improved masked crops
-            similarity_scores = sim.compute_object_similarity(crops, prompt)
-            
-            if not similarity_scores:
-                print("❌ Could not compute similarity scores!")
-                continue
-            
-            # Show similarity results
-            print("\n📊 Individual Crop Similarity Scores:")
-            sorted_scores = sorted(similarity_scores.items(), key=lambda x: x[1], reverse=True)
-            for obj_name, score in sorted_scores:
-                bar = "█" * int(score * 20)  # Visual bar
-                print(f"  {obj_name:15}: {score:.3f} {bar}")
-            
-            # Select best object
-            selected_object, best_score = sim.select_best_object(similarity_scores)
-            
-            if not selected_object:
-                print("❌ No suitable object found!")
-                continue
-            
-            print(f"\n🎯 Selected: {selected_object} (confidence: {best_score:.3f})")
-            
-            # Ask user for confirmation
-            print("Options:")
-            print("  y = Pick up and choose placement zone")
-            print("  n = Cancel")
-            confirm = input(f"What to do with {selected_object}? (y/n): ").lower()
-            
-            if confirm in ['y', 'yes', '']:
-                print(f"🤖 Picking up {selected_object}...")
-                success = sim.pick_object(selected_object)
-                if success:
-                    print(f"📍 Where would you like to place {selected_object}?")
-                    print("1. 🔴 Red zone (left front)")
-                    print("2. 🔵 Blue zone (left back)")
-                    print("3. 🟢 Green zone (right front)")
-                    print("4. 🟡 Yellow zone (right back)")
-                    print("5. 🗑️  Throw away (fast throw!)")
-                    
-                    place_choice = input("Choose destination (1-5): ").strip()
-                    
-                    if place_choice == "1":
-                        place_object_in_specific_zone(sim, selected_object, 'red_zone')
-                        print(f"✅ Successfully placed {selected_object} in RED zone!")
-                    elif place_choice == "2":
-                        place_object_in_specific_zone(sim, selected_object, 'blue_zone')
-                        print(f"✅ Successfully placed {selected_object} in BLUE zone!")
-                    elif place_choice == "3":
-                        place_object_in_specific_zone(sim, selected_object, 'green_zone')
-                        print(f"✅ Successfully placed {selected_object} in GREEN zone!")
-                    elif place_choice == "4":
-                        place_object_in_specific_zone(sim, selected_object, 'yellow_zone')
-                        print(f"✅ Successfully placed {selected_object} in YELLOW zone!")
-                    elif place_choice == "5":
-                        throw_object_away(sim, selected_object)
-                        print(f"🗑️ Threw away {selected_object} with style!")
-                    else:
-                        print("❌ Invalid choice, using safe placement...")
-                        safe_place_object(sim, selected_object)
-                        print(f"✅ Safely placed {selected_object}!")
-                else:
-                    print(f"❌ Failed to pick up {selected_object}")
-            else:
-                print("🚫 Operation cancelled.")
-            
-            # Show updated scene
-            print("\n📸 Updated scene:")
-            final_image = sim.capture_camera_image()
-            
+
+            result = handle_command(sim, prompt, catalog)
+
             # Optional: show images side by side
-            show_images = input("Show before/after images? (y/n): ").lower()
-            if show_images in ['y', 'yes']:
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-                
-                ax1.imshow(camera_image)
-                ax1.set_title("Before")
-                ax1.axis('off')
-                
-                ax2.imshow(final_image)
-                ax2.set_title("After")
-                ax2.axis('off')
-                
-                plt.tight_layout()
-                plt.show()
-                
+            if result.get('camera_image') is not None and result.get('picked'):
+                print("\n📸 Updated scene:")
+                final_image = sim.capture_camera_image()
+                show_images = input("Show before/after images? (y/n): ").lower()
+                if show_images in ['y', 'yes']:
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
+                    ax1.imshow(result['camera_image'])
+                    ax1.set_title("Before")
+                    ax1.axis('off')
+
+                    ax2.imshow(final_image)
+                    ax2.set_title("After")
+                    ax2.axis('off')
+
+                    plt.tight_layout()
+                    plt.show()
+
         except KeyboardInterrupt:
             print("\n👋 Demo interrupted by user.")
             break
@@ -352,8 +295,179 @@ def run_interactive_text_prompt_demo(sim):
             import traceback
             traceback.print_exc()
             continue
-    
+
     print("Interactive demo completed!")
+
+
+def compute_clip_scores(sim, crops, text):
+    """
+    Call the existing CLIP ranking (sim.compute_object_similarity).
+
+    With exactly one visible crop the upstream softmax/indexing can fail
+    (0-dim tensor); in that case the only crop is returned with score 1.0 and a
+    note, because a softmax over a single item is 1.0 by definition.
+    """
+    try:
+        return sim.compute_object_similarity(crops, text), None
+    except (IndexError, RuntimeError, TypeError) as e:
+        if len(crops) == 1:
+            name = next(iter(crops))
+            return {name: 1.0}, f"single visible crop - softmax is trivially 1.0 ({type(e).__name__})"
+        raise
+
+
+def ask_destination(sim, ask=input):
+    """Placement menu with validation. Returns a zone name, 'throw' or 'safe'."""
+    print(f"📍 {S('Where should it go?', 'bold')}")
+    labels = {"throw": "🗑️  Throw away (fast throw!)", "safe": "Safe default position"}
+    for key, dest in ZONE_MENU:
+        if dest in sim.sorting_zones:
+            cfg = sim.sorting_zones[dest]
+            print(f"   {S(key, 'bold', 'cyan')}. {paint_object(dest)}  {S(zone_side(cfg['position']), 'gray')}")
+        else:
+            print(f"   {S(key, 'bold', 'cyan')}. {labels[dest]}")
+    for attempt in range(1, MAX_ZONE_ATTEMPTS + 1):
+        dest = parse_zone_choice(ask(f"Choose destination (1-5, s): "), sim.sorting_zones)
+        if dest:
+            return dest
+        left = MAX_ZONE_ATTEMPTS - attempt
+        if left:
+            print(S(f"   ✖ Invalid placement zone. {left} attempt(s) left.", "red"))
+    print(S("   ✖ No valid zone given - using the SAFE default position "
+            "(the object is held and must be released).", "yellow"))
+    return "safe"
+
+
+def execute_placement(sim, object_name, destination):
+    if destination in sim.sorting_zones:
+        place_object_in_specific_zone(sim, object_name, destination)
+    elif destination == "throw":
+        throw_object_away(sim, object_name)
+    else:
+        safe_place_object(sim, object_name)
+
+
+def handle_command(sim, prompt, catalog, ask=input):
+    """
+    Full pipeline for one text command. Returns a result dict:
+      status      - parser/selection status or 'DONE' / 'CANCELLED' / 'PICK_FAILED'
+      selected    - chosen object name or None
+      destination - zone name / 'throw' / 'safe' / None
+      placement   - 'VERIFIED' / 'NOT_IN_ZONE' / 'UNVERIFIED' / None
+    """
+    result = {'status': None, 'selected': None, 'destination': None,
+              'placement': None, 'picked': False, 'camera_image': None}
+
+    # 1) Language: validate command against the objects that exist in the sim
+    parsed = parse_command(prompt, catalog)
+    print(rule())
+    print(f"🔍 {S('Command', 'bold')}: {S(repr(prompt), 'cyan')}")
+    if parsed.status not in (OK, AMBIGUOUS):
+        print(panel(f"Rejected: {parsed.status}", [parsed.message,
+                    S("Type 'help' for supported commands. Nothing was moved.", "gray")], kind="error"))
+        result['status'] = parsed.status
+        return result
+    detail = []
+    if parsed.color or parsed.shape:
+        detail.append(f"color={parsed.color or '-'}  shape={parsed.shape or '-'}")
+    if parsed.zone:
+        detail.append(f"zone={parsed.zone}")
+    detail.append(f"CLIP text: {S(repr(parsed.clip_text), 'cyan')}")
+    print(f"   {S(' · '.join(detail), 'gray')}")
+
+    # 2) Vision: camera image -> segmentation crops
+    print(f"📸 {S('Capturing scene with segmentation...', 'bold')}")
+    camera_image, bounding_boxes, crops = sim.capture_and_process_scene()
+    result['camera_image'] = camera_image
+    valid_crops, problems = validate_crops(crops, bounding_boxes, catalog)
+    for msg in problems:
+        print(S(f"   ! {msg}", "yellow"))
+    if not valid_crops:
+        print(panel("No objects detected", ["The camera sees no usable object crops."], kind="error"))
+        result['status'] = NO_OBJECTS
+        return result
+
+    # 3) CLIP similarity (original ranking mechanism)
+    scores, note = compute_clip_scores(sim, valid_crops, parsed.clip_text)
+    if note:
+        print(S(f"   ! {note}", "yellow"))
+    selection = select_target(parsed, scores)
+
+    print(f"\n📊 {S('CLIP similarity (sorted)', 'bold')}")
+    for line in score_table(selection.ranking, selection.selected, parsed.candidates):
+        print(line)
+    print(S("   ★ selected  ◆ matches command  · other    "
+            "scores are relative, not calibrated confidence", "gray"))
+
+    if selection.status not in (OK, AMBIGUOUS):
+        print(panel(f"Rejected: {selection.status}", [selection.message,
+                    S("Nothing was moved.", "gray")], kind="error"))
+        result['status'] = selection.status
+        return result
+
+    # 4) Ambiguity: never choose silently, ask the user
+    if selection.status == AMBIGUOUS:
+        lines = [selection.message]
+        for i, (name, score) in enumerate(selection.candidate_ranking, 1):
+            lines.append(f"  {S(str(i), 'bold', 'cyan')}. {paint_object(name)}  {S(f'{score:.3f}', 'gray')}")
+        print(panel("Ambiguous command", lines, kind="warn"))
+        pick = ask(f"Choose 1-{len(selection.candidate_ranking)} (Enter = cancel): ").strip()
+        if not pick.isdigit() or not 1 <= int(pick) <= len(selection.candidate_ranking):
+            print("🚫 Operation cancelled.")
+            result['status'] = 'CANCELLED'
+            return result
+        selection.selected = selection.candidate_ranking[int(pick) - 1][0]
+    elif not selection.clip_agrees:
+        print(S(f"   ! {selection.message}", "yellow"))
+
+    selected = selection.selected
+    result['selected'] = selected
+    sel_score = dict(selection.ranking).get(selected, 0.0)
+    print(f"\n🎯 {S('Selected', 'bold')}: {paint_object(selected)}  {S(f'(CLIP score {sel_score:.3f})', 'gray')}")
+
+    # Ask user for confirmation
+    confirm = ask(f"Pick up {selected}? (y/n): ").strip().lower()
+    if confirm not in ['y', 'yes', '']:
+        print("🚫 Operation cancelled.")
+        result['status'] = 'CANCELLED'
+        return result
+
+    # 5) Robot: existing controller
+    print(f"🤖 Picking up {selected}...")
+    before = get_object_position(sim, selected)
+    if not sim.pick_object(selected):
+        print(panel("Pick failed", [f"sim.pick_object('{selected}') returned False."], kind="error"))
+        result['status'] = 'PICK_FAILED'
+        return result
+    after = get_object_position(sim, selected)
+    result['picked'] = True
+    if before is not None and after is not None and not is_lifted(before, after):
+        print(panel("Grasp not verified", [
+            f"Object did not rise with the gripper: {_fmt_pos(before)} → {_fmt_pos(after)}",
+            "Releasing and returning home; nothing will be placed."], kind="error"))
+        sim.control_gripper(sim.gripper_open_position)
+        sim.move_to_position(sim.home_position)
+        result['status'] = 'PICK_FAILED'
+        return result
+
+    # 6) Placement zone (from the command, or ask)
+    destination = parsed.zone or ask_destination(sim, ask)
+    result['destination'] = destination
+    print(f"🚚 Moving {paint_object(selected)} → {S(destination, 'bold')}")
+    execute_placement(sim, selected, destination)
+    settle()
+
+    # 7) Verify from simulator state, not from the motion call returning
+    status, pos = verify_placement(sim, selected, destination)
+    result['placement'] = status
+    result['status'] = 'DONE'
+    if status == "VERIFIED":
+        print(panel("Placement verified", [f"{selected} is at {_fmt_pos(pos)} inside {destination}."], kind="ok"))
+    elif status == "NOT_IN_ZONE":
+        print(panel("Placement NOT achieved", [f"{selected} ended at {_fmt_pos(pos)}, outside {destination}."], kind="error"))
+    else:
+        print(panel("Placement unverified", ["Could not read the object pose; result unknown."], kind="warn"))
+    return result
 
 
 def analyze_full_scene_with_prompt(sim, prompt):
